@@ -42,6 +42,7 @@
 ```bash
 #!/bin/bash
 set -euo pipefail
+python3 -c "import sglang.srt.models.minicpm; print('OK -', sglang.srt.models.minicpm.MiniCPMSALAForCausalLM)"
 
 MODEL_PATH=/data/weights/MiniCPM-SALA/
 export HCCL_SOCKET_IFNAME=lo
@@ -71,4 +72,9 @@ python3 -m sglang.launch_server \
 curl http://127.0.0.1:30000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{ "model": "default", "messages": [{"role": "user", "content": "你好"}], "max_tokens": 64 }'
+
+
+curl http://127.0.0.1:8010/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{ "model": "qwen3.5", "temperature": 0.0, "messages": [{"role": "user", "content": "你好"}], "max_tokens": 4 }'
 ```
