@@ -301,11 +301,14 @@ class RotaryEmbedding(MultiPlatformOp):
         else:
             rotary_mode = "interleave"
         mrope_section = [0, 0, 0]
+        cos_sin_cache = self.cos_sin_cache
+        if cos_sin_cache.dtype != torch.float32:
+            cos_sin_cache = cos_sin_cache.float()
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
             key,
-            self.cos_sin_cache,
+            cos_sin_cache,
             self.head_size,
             mrope_section=mrope_section,
             rotary_mode=rotary_mode,

@@ -22,10 +22,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-import tilelang
-import tilelang.math
+# import tilelang
+# import tilelang.math
 import triton
-from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
+# from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
 
 from sglang.srt.layers.attention.minicpm_fuse_kernel import _bucket_size
 from sglang.srt.layers.attention.minicpm_sparse_kernels import (
@@ -504,13 +504,13 @@ def compressed_attention(
                 .transpose(0, 1)
                 .reshape(-1, head_dim, k1_len // batch_size)
             )
-    
+
             scale = 1.0 / math.sqrt(head_dim)
             score = torch.bmm(q_reshape, k_reshape).mul_(scale)
             torch.nan_to_num(score, nan=float("-inf"), posinf=float("-inf"), out=score)
             torch.softmax(score, dim=-1, out=score)
             score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
-        else:  
+        else:
             score = infllmv2_attn_stage1(
                 q.contiguous(),
                 k.contiguous(),
