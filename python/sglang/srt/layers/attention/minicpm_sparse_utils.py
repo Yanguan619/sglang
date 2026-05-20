@@ -366,7 +366,7 @@ def allocate_and_compress_keys(
     """
     if device is None:
         device = (
-            layer.device if hasattr(layer, "device") else torch.cuda.current_device()
+            layer.device if hasattr(layer, "device") else forward_batch.seq_lens.device
         )
 
     full_compressed_k1 = torch.full(
@@ -1428,7 +1428,7 @@ class SparseMetadataBuilder:
             dtype=torch.int32,
             device=base_metadata.cu_seqlens_q.device,
         )
-        token_to_bs = torch.arange(0, bs, dtype=torch.int32, device="cuda")
+        token_to_bs = torch.arange(0, bs, dtype=torch.int32, device=page_table.device)
         sparse_page_table = torch.zeros(
             (2 * bs, sparse_topk * block_size),
             dtype=page_table.dtype,

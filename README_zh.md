@@ -63,9 +63,12 @@ bash install_minicpm_sala.sh https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simpl
 ```bash
 # 激活环境
 source sglang_minicpm_sala_env/bin/activate
-
+export ASCEND_RT_VISIBLE_DEVICES="4" # (可选) 指定使用的 GPU 设备
+export STREAMS_PER_DEVICE=32
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 # error->warn
 # 启动推理服务（将 MODEL_PATH 替换为实际模型路径）
-MODEL_PATH=/path/to/your/model
+MODEL_PATH=/data/weights/MiniCPM-SALA/
 
 python3 -m sglang.launch_server \
     --model ${MODEL_PATH} \
@@ -73,7 +76,7 @@ python3 -m sglang.launch_server \
     --disable-radix-cache \
     --attention-backend minicpm_flashinfer \
     --chunked-prefill-size 8192 \
-    --max-running-requests 32 \
+    --max-running-requests 2 \
     --skip-server-warmup \
     --port 31111 \
     --dense-as-sparse

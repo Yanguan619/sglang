@@ -7,11 +7,24 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.hardware_backend.npu.attention.minicpm_sparse_npu import (
+    get_block_table_v2_ref,
+    get_block_table_v3_ref,
+    infllmv2_attn_stage1_npu,
+    max_pooling_1d_varlen_npu,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.minicpm_sparse_utils import (
+    SparseBatchAnalyzer,
+    SparseConfig,
+    SparseMetadataBuilder,
+    allocate_and_compress_keys,
+    compressed_attention,
+)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -57,6 +70,28 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # sparse attention fields (MiniCPM)
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    cu_seqlens_k: Optional[torch.Tensor] = None
+    max_seq_len_q: Optional[int] = None
+    max_seq_len_k: Optional[int] = None
+    cache_seqlens_int32: Optional[torch.Tensor] = None
+    k1: Optional[object] = None
+    k2: Optional[object] = None
+    sparse_bs_list: Optional[list] = None
+    sparse_page_table: Optional[torch.Tensor] = None
+    sparse_cache_seqlens_int32: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k: Optional[torch.Tensor] = None
+    sparse_max_seq_len_q: Optional[int] = None
+    token_to_bs: Optional[torch.Tensor] = None
+    token_pos_in_bs: Optional[torch.Tensor] = None
+    cache_seqlens_int32_stage1: Optional[torch.Tensor] = None
+    cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
+    max_seqlen_q_adjusted: Optional[int] = None
+    seqlen_k_sparse_bs_tensor: Optional[torch.Tensor] = None
+    sparse_idx: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -234,6 +269,53 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
+        # Sparse attention configuration (MiniCPM)
+        self.use_sparse_attention = False
+        self.sparse_config = None
+        self.sparse_batch_analyzer = None
+        self.sparse_metadata_builder = None
+        hf_config = getattr(model_runner.model_config, "hf_config", None)
+        if hf_config is not None and getattr(hf_config, "has_sparse_attention", False):
+            self.use_sparse_attention = True
+            self.sparse_kernel_size = hf_config.sparse_kernel_size
+            self.sparse_kernel_stride = hf_config.sparse_kernel_stride
+            self.init_blocks = hf_config.sparse_init_blocks
+            self.block_size = hf_config.sparse_block_size
+            self.sparse_window_size = hf_config.sparse_window_size
+            self.dense_len = hf_config.sparse_dense_len
+            topk = hf_config.sparse_topk
+            self.local_blocks = self.sparse_window_size // self.block_size
+            self.sparse_topk = topk + self.local_blocks
+            self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
+            self.head_dim = model_runner.model_config.head_dim
+            self.head_group_num = model_runner.model_config.num_key_value_heads
+            self.num_kv_heads = self.head_group_num
+            self.heads_per_group = (
+                model_runner.model_config.num_attention_heads // self.head_group_num
+            )
+            self.k1_kernel_size = self.sparse_kernel_size
+            self.k1_kernel_stride = self.sparse_kernel_stride
+            self.k2_kernel_size = self.sparse_kernel_size * 4
+            self.k2_kernel_stride = self.sparse_kernel_stride * 4
+            self.split_stage1 = getattr(
+                model_runner.server_args, "split_stage1", False
+            )
+
+            import sglang.srt.layers.attention.minicpm_sparse_utils as _sparse_utils
+
+            _sparse_utils.infllmv2_attn_stage1 = infllmv2_attn_stage1_npu
+            _sparse_utils.max_pooling_1d_varlen = max_pooling_1d_varlen_npu
+
+            sparse_config = SparseConfig.from_model_config(
+                hf_config, model_runner.model_config
+            )
+            self.sparse_batch_analyzer = SparseBatchAnalyzer(sparse_config)
+            self.sparse_metadata_builder = SparseMetadataBuilder(
+                sparse_config,
+                num_kv_heads=self.head_group_num,
+                max_context_len=self.max_context_len,
+            )
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -304,6 +386,183 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         self.graph_mode = False
+
+        if self.use_sparse_attention:
+            self._init_minicpm_sparse_metadata(forward_batch)
+
+    def _init_minicpm_sparse_metadata(self, forward_batch: ForwardBatch):
+        fm = self.forward_metadata
+        bs = forward_batch.batch_size
+        device = self.device
+
+        fm.page_table = fm.block_tables  # alias for get_compress_k_v2
+
+        seqlens_in_batch = forward_batch.seq_lens
+        fm.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+        fm.cache_seqlens_int32_stage1 = fm.cache_seqlens_int32 - 1
+
+        # Build the cu_seqlens and page_table (same as MiniCPMBackend's pattern)
+        if forward_batch.forward_mode.is_decode_or_idle():
+            fm.max_seq_len_q = 1
+            fm.max_seq_len_k = seqlens_in_batch.max().item()
+            cu_seqlens_q = torch.arange(
+                0, bs + 1, dtype=torch.int32, device=device
+            )
+            fm.cu_seqlens_q = cu_seqlens_q
+            fm.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            fm.sparse_max_seq_len_q = 1
+            fm.cu_seqlens_q_adjusted = cu_seqlens_q * self.heads_per_group
+            fm.max_seqlen_q_adjusted = 1 * self.heads_per_group
+            # K1/K2 compression metadata
+            compression = (
+                self.sparse_metadata_builder.build_k1_k2_compression_metadata(
+                    forward_batch=forward_batch,
+                    base_metadata=fm,
+                    req_to_sparse_k1_token=(
+                        forward_batch.req_to_token_pool.req_to_sparse_k1_token
+                    ),
+                    req_to_sparse_k2_token=(
+                        forward_batch.req_to_token_pool.req_to_sparse_k2_token
+                    ),
+                    k1_kernel_size=self.k1_kernel_size,
+                    k1_kernel_stride=self.k1_kernel_stride,
+                    k2_kernel_size=self.k2_kernel_size,
+                    k2_kernel_stride=self.k2_kernel_stride,
+                    cu_seqlens_q=cu_seqlens_q,
+                )
+            )
+            fm.k1 = compression["k1"]
+            fm.k2 = compression["k2"]
+
+            decode_md = self.sparse_metadata_builder.build_sparse_decode_metadata(
+                forward_batch=forward_batch,
+                base_metadata=fm,
+                head_group_num=self.head_group_num,
+                dense_len=self.dense_len,
+                sparse_topk=self.sparse_topk,
+                block_size=self.block_size,
+            )
+            fm.sparse_cache_seqlens_int32 = decode_md["sparse_cache_seqlens_int32"]
+            fm.sparse_cu_seqlens_k = decode_md["sparse_cu_seqlens_k"]
+            fm.sparse_cu_seqlens_q = decode_md["sparse_cu_seqlens_q"]
+            fm.sparse_page_table = decode_md["sparse_page_table"]
+            fm.token_to_bs = decode_md["token_to_bs"]
+
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
+            # Use prefill metadata
+            cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            if any(forward_batch.extend_prefix_lens_cpu):
+                extend_seq_lens = forward_batch.extend_seq_lens
+                cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                cu_seqlens_q = cu_seqlens_k
+
+            fm.cu_seqlens_q = cu_seqlens_q
+            fm.cu_seqlens_k = cu_seqlens_k
+            fm.max_seq_len_q = (
+                forward_batch.extend_seq_lens.max().item()
+                if any(forward_batch.extend_prefix_lens_cpu)
+                else seqlens_in_batch.max().item()
+            )
+            fm.max_seq_len_k = seqlens_in_batch.max().item()
+
+            compression = (
+                self.sparse_metadata_builder.build_k1_k2_compression_metadata(
+                    forward_batch=forward_batch,
+                    base_metadata=fm,
+                    req_to_sparse_k1_token=(
+                        forward_batch.req_to_token_pool.req_to_sparse_k1_token
+                    ),
+                    req_to_sparse_k2_token=(
+                        forward_batch.req_to_token_pool.req_to_sparse_k2_token
+                    ),
+                    k1_kernel_size=self.k1_kernel_size,
+                    k1_kernel_stride=self.k1_kernel_stride,
+                    k2_kernel_size=self.k2_kernel_size,
+                    k2_kernel_stride=self.k2_kernel_stride,
+                    cu_seqlens_q=cu_seqlens_q,
+                )
+            )
+            fm.k1 = compression["k1"]
+            fm.k2 = compression["k2"]
+
+            fm.sparse_bs_list = (
+                self.sparse_batch_analyzer.identify_sparse_batches(
+                    forward_batch, dense_as_sparse=False
+                )
+            )
+
+            seqlen_q_sparse_bs, fm.seqlen_k_sparse_bs_tensor = (
+                self.sparse_metadata_builder.build_sequence_lengths(
+                    cu_seqlens_q,
+                    forward_batch.extend_prefix_lens,
+                    fm.sparse_bs_list,
+                )
+            )
+
+            cu_seqlens_q_sparse_bs = torch.tensor(
+                [0] + seqlen_q_sparse_bs, dtype=torch.int32, device=device
+            ).cumsum(dtype=torch.int32, dim=0)
+
+            extend_prefix_lens_sparse = torch.tensor(
+                [
+                    forward_batch.extend_prefix_lens_cpu[bs]
+                    for bs in fm.sparse_bs_list
+                ],
+                dtype=torch.long,
+                device="cpu",
+            )
+
+            fm.token_to_bs, fm.token_pos_in_bs = (
+                self.sparse_metadata_builder.build_token_mappings(
+                    cu_seqlens_q_sparse_bs,
+                    extend_prefix_lens_sparse,
+                    seqlen_q_sparse_bs,
+                )
+            )
+            fm.token_to_bs = fm.token_to_bs.to(device=device)
+            fm.token_pos_in_bs = fm.token_pos_in_bs.to(device=device)
+
+            prefill_md = (
+                self.sparse_metadata_builder.build_sparse_prefill_metadata(
+                    forward_batch=forward_batch,
+                    base_metadata=fm,
+                    sparse_bs_list=fm.sparse_bs_list,
+                    head_group_num=self.head_group_num,
+                    dense_len=self.dense_len,
+                    sparse_topk=self.sparse_topk,
+                    block_size=self.block_size,
+                    cu_seqlens_q=cu_seqlens_q,
+                    sparse_page_table_dtype=fm.block_tables.dtype,
+                    sparse_page_table_device=device,
+                )
+            )
+
+            fm.sparse_page_table = prefill_md["sparse_page_table"]
+            fm.sparse_cu_seqlens_q = prefill_md["sparse_cu_seqlens_q"]
+            fm.sparse_max_seq_len_q = prefill_md["sparse_max_seq_len_q"]
+            fm.sparse_idx = prefill_md["sparse_idx"]
+            fm.old_bs_to_new_bs_range = prefill_md["old_bs_to_new_bs_range"]
+            fm.sparse_cu_seqlens_q_cpu = prefill_md["sparse_cu_seqlens_q_cpu"]
+
+            fm.cu_seqlens_q_adjusted = fm.sparse_cu_seqlens_q * self.heads_per_group
+            fm.max_seqlen_q_adjusted = (
+                fm.sparse_max_seq_len_q * self.heads_per_group
+            )
+
+        else:
+            if forward_batch.forward_mode.is_target_verify():
+                raise NotImplementedError(
+                    "MiniCPM sparse backend does not support target verify"
+                )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.graph_metadata = {
@@ -564,6 +823,269 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _get_topk_for_sparse(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        is_prefill: bool = True,
+    ) -> torch.Tensor:
+        fm = self.forward_metadata
+
+        if is_prefill:
+            cu_seqlens_q = fm.sparse_cu_seqlens_q
+            cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            max_seqlen_q = fm.sparse_max_seq_len_q
+            max_seqlen_k = forward_batch.seq_lens_cpu.max().item()
+
+            total_k1 = fm.k1.cu_total_compress_token_nums[-1].item()
+            total_k2 = fm.k2.cu_total_compress_token_nums[-1].item()
+
+            full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=fm,
+                k1_token_nums=total_k1,
+                k2_token_nums=total_k2,
+                dtype=torch.bfloat16,
+                device=self.device,
+                max_context_length=self.max_context_len,
+            )
+
+            topk_idx = compressed_attention(
+                q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim),
+                full_compressed_k1,
+                full_compressed_k2,
+                self.k1_kernel_size,
+                self.k1_kernel_stride,
+                self.block_size,
+                self.sparse_topk,
+                cu_seqlens_q,
+                fm.k1.cu_seqlens,
+                fm.k2.cu_seqlens,
+                max_seqlen_q,
+                self.max_context_len,
+                None,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                cu_seqlens_q_adjusted=fm.cu_seqlens_q_adjusted,
+                max_seqlen_q_adjusted=fm.max_seqlen_q_adjusted,
+            )
+        else:
+            total_k1 = forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride
+            total_k2 = forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride
+
+            full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=fm,
+                k1_token_nums=total_k1,
+                k2_token_nums=total_k2,
+                dtype=torch.bfloat16,
+                device=self.device,
+                max_context_length=self.max_context_len,
+                split_stage1=self.split_stage1,
+            )
+
+            q_1d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            cu_seqlens_q = fm.cu_seqlens_q
+            cu_seqlens_k = fm.cu_seqlens_k
+            max_seqlen_q = fm.max_seq_len_q
+            max_seqlen_k = fm.max_seq_len_k
+
+            topk_idx = compressed_attention(
+                q_1d.unsqueeze(0),
+                full_compressed_k1,
+                full_compressed_k2,
+                self.k1_kernel_size,
+                self.k1_kernel_stride,
+                self.block_size,
+                self.sparse_topk,
+                cu_seqlens_q,
+                fm.k1.cu_seqlens,
+                fm.k2.cu_seqlens,
+                max_seqlen_q,
+                self.max_context_len,
+                None,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                cu_seqlens_q_adjusted=fm.cu_seqlens_q_adjusted,
+                max_seqlen_q_adjusted=fm.max_seqlen_q_adjusted,
+                split_stage1=self.split_stage1,
+            )
+
+        return topk_idx
+
+    def _forward_extend_minicpm_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        if layer.is_cross_attention:
+            raise NotImplementedError("MiniCPM sparse backend does not support cross attention")
+
+        bs = forward_batch.batch_size
+        fm = self.forward_metadata
+
+        if k is not None and save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        topk_idx = self._get_topk_for_sparse(q_reshaped, layer, forward_batch, is_prefill=True)
+
+        page_table = fm.block_tables
+        if max(forward_batch.seq_lens_cpu) >= self.dense_len:
+            sparse_pt_sparse_bs = get_block_table_v2_ref(
+                topk_idx,
+                page_table,
+                fm.token_to_bs,
+                fm.token_pos_in_bs,
+                fm.seqlen_k_sparse_bs_tensor,
+                self.sparse_topk,
+                self.block_size,
+            )
+            fm.sparse_page_table[fm.sparse_idx, :self.num_sparse_topk_tokens] = (
+                sparse_pt_sparse_bs[:, :self.num_sparse_topk_tokens]
+            )
+
+        q_by_hg = q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim)
+
+        if fm.sparse_bs_list is not None and len(fm.sparse_bs_list) < bs:
+            dense_bs_list = [i for i in range(bs) if i not in fm.sparse_bs_list]
+            for dense_bs in dense_bs_list:
+                sparse_page_table_idx_start = fm.old_bs_to_new_bs_range[dense_bs]
+                sparse_page_table_idx_end = fm.old_bs_to_new_bs_range[dense_bs + 1]
+                if sparse_page_table_idx_end - sparse_page_table_idx_start == 2:
+                    ps = fm.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start].item()
+                    length = fm.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start + 1].item() - ps
+                    if length > 0:
+                        t = q_by_hg[ps:ps + 2 * length, :, :].clone()
+                        q_by_hg[ps:ps + length, :, :] = t[0::2, :, :]
+                        q_by_hg[ps + length:ps + 2 * length, :, :] = t[1::2, :, :]
+                        kv_len = forward_batch.seq_lens_cpu[dense_bs]
+                        fm.sparse_page_table[sparse_page_table_idx_start, :kv_len] = page_table[dense_bs, :kv_len]
+                        fm.sparse_page_table[sparse_page_table_idx_start + 1, :kv_len] = page_table[dense_bs, :kv_len]
+
+        sparse_cache_seqlens = (fm.sparse_page_table != 0).sum(dim=1).to(
+            dtype=torch.int32, device=self.device
+        )
+
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        sparse_pt = fm.sparse_page_table.to(torch.int32).long()
+        sparse_pt = sparse_pt.clamp(0, key_cache.shape[0] - 1)
+        k_gathered = key_cache[sparse_pt].squeeze(2)
+        v_gathered = value_cache[sparse_pt].squeeze(2)
+
+        scale = layer.scaling
+        attn_output = torch.zeros(
+            q_by_hg.shape[0], layer.tp_q_head_num // 2, layer.v_head_dim,
+            dtype=q.dtype, device=self.device,
+        )
+
+        pos = 0
+        for i in range(sparse_pt.shape[0]):
+            ctx_len = sparse_cache_seqlens[i].item()
+            if ctx_len <= 0:
+                pos += 1
+                continue
+            q_i = q_by_hg[pos:pos + 1]
+            k_i = k_gathered[i, :ctx_len]
+            v_i = v_gathered[i, :ctx_len]
+            scores = torch.einsum('qd,kmd->qkm', q_i.float(), k_i.float()) * scale
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_output[pos] = torch.einsum('qkm,kmd->qd', attn_weights, v_i.float()).to(q.dtype)
+            pos += 1
+
+        if fm.sparse_bs_list is not None and len(fm.sparse_bs_list) < bs:
+            for dense_bs in dense_bs_list:
+                sparse_page_table_idx_start = fm.old_bs_to_new_bs_range[dense_bs]
+                if sparse_page_table_idx_start >= attn_output.shape[0]:
+                    continue
+                ps = fm.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start].item()
+                length = fm.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start + 1].item() - ps
+                if length >= 2:
+                    t = attn_output[ps:ps + 2 * length, :, :].clone()
+                    attn_output[ps:ps + 2 * length:2, :, :] = t[:length, :, :]
+                    attn_output[ps + 1:ps + 2 * length:2, :, :] = t[length:2 * length, :, :]
+
+        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_decode_minicpm_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        if layer.is_cross_attention:
+            raise NotImplementedError("MiniCPM sparse backend does not support cross attention")
+
+        bs = forward_batch.batch_size
+        fm = self.forward_metadata
+
+        if k is not None and save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        page_table = fm.block_tables
+        cache_seqlens = fm.cache_seqlens_int32
+
+        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        topk_idx = self._get_topk_for_sparse(q_reshaped, layer, forward_batch, is_prefill=False)
+
+        sparse_page_table = get_block_table_v3_ref(
+            topk_idx,
+            page_table,
+            fm.token_to_bs,
+            cache_seqlens,
+            cache_seqlens,
+            self.sparse_topk,
+            self.block_size,
+        )
+        fm.sparse_page_table[:2 * bs, :self.num_sparse_topk_tokens] = (
+            sparse_page_table[:, :self.num_sparse_topk_tokens]
+        )
+
+        q_by_hg = q.reshape(-1, layer.tp_q_head_num // 2, layer.head_dim)
+
+        sparse_cache_seqlens = (fm.sparse_page_table != 0).sum(dim=1).to(
+            dtype=torch.int32, device=self.device
+        )
+
+        _, _, full_kv_heads, head_dim = key_cache.shape
+
+        attn_output = torch.empty(
+            q_by_hg.shape[0], layer.tp_q_head_num // 2, layer.v_head_dim,
+            dtype=q.dtype, device=self.device,
+        )
+
+        torch_npu._npu_paged_attention(
+            query=q_by_hg,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            num_heads=layer.tp_q_head_num // 2,
+            num_kv_heads=layer.tp_k_head_num // 2,
+            scale_value=layer.scaling,
+            block_table=sparse_pt,
+            context_lens=sparse_cache_seqlens,
+            out=attn_output,
+        )
+
+        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -577,6 +1099,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if self.use_sparse_attention:
+            return self._forward_extend_minicpm_sparse(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
         if topk_indices is not None:
             return self.forward_sparse(
                 q,
@@ -1218,6 +1744,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if self.use_sparse_attention:
+            return self._forward_decode_minicpm_sparse(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
             save_kv_cache = False

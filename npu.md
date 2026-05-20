@@ -1,3 +1,28 @@
+```bash
+IMAGE=quay.nju.edu.cn/ascend/vllm-ascend:v0.18.0rc1-a3
+MODEL=/data/
+docker run -itd --name "$(date +%Y-%m-%d)" \
+	--privileged \
+	--ipc=host \
+	--net=host \
+	--shm-size=500g \
+	-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+	-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+	-v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+	-v /usr/local/dcmi:/usr/local/dcmi \
+	-v /usr/local/sbin:/usr/local/sbin \
+	-v /etc/hccn.conf:/etc/hccn.conf \
+	-v $MODEL:$MODEL \
+	-e VLLM_USE_MODELSCOPE=true \
+	-e ASCEND_RT_VISIBLE_DEVICES="0,1" \
+	-e HCCL_OPEXPANSIONMODE="AIV" \
+	-e HCCL_BUFFSIZE="1024" \
+	-e OMP_PROC_BIND="false" \
+	-e OMP_NUM_THREADS="1" \
+	-e TASK_QUEUE_ENABLE="1" \
+    $IMAGE bash
+```
+
 # https://docs.sglang.com.cn/platforms/ascend_npu.html
 # fla
 ```bash
@@ -34,7 +59,7 @@
 ```bash
 (
     cd sglang-minicpm
-    mv python/pyproject_other.toml python/pyproject.toml
+    # mv python/pyproject_other.toml python/pyproject.toml
     pip install -e python[srt_npu]
 )
 ```
