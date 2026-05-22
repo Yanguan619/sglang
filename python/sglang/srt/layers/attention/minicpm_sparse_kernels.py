@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from functools import lru_cache
 
 
 # TODO. Now only page size == 1 is supported. Consider extend to page size > 1
@@ -36,7 +35,7 @@ def compress_k_complete_kernel_new(
     where max_total_chunks = max_chunks_per_seq + max_history_chunks
     - chunk_in_seq in [0, history_chunks_in_seq): process HISTORY chunks
     - chunk_in_seq in [history_chunks_in_seq, total_chunks_in_seq): process NEW chunks
-    
+
     If total_chunks > max_grid_chunks, each thread block loops to handle multiple chunks.
 
     Each thread processes one (batch, chunk_in_seq, head) combination.
@@ -67,7 +66,7 @@ def compress_k_complete_kernel_new(
     batch_idx = tl.program_id(0)
     grid_chunk_idx = tl.program_id(1)
     head_idx = tl.program_id(2)
-    
+
     # Total number of chunks this thread block needs to process
     chunk_stride = max_grid_chunks
 
@@ -100,10 +99,10 @@ def compress_k_complete_kernel_new(
     # ====================================================================
     # LOOP: Handle multiple chunks per thread block if needed
     # ====================================================================
-    
+
     # Iterate over all chunks assigned to this thread block
     chunk_in_seq = grid_chunk_idx
-    
+
     while chunk_in_seq < total_chunks_in_seq:
         # Determine if processing history or new chunks
         is_history_chunk = chunk_in_seq < history_chunks_in_seq
@@ -270,7 +269,7 @@ def compress_k_complete_kernel_new(
                                 x,
                                 mask=tl.arange(0, BLOCK_SIZE) < head_dim
                             )
-        
+
         # Move to next chunk for this thread block
         chunk_in_seq += chunk_stride
 
@@ -300,19 +299,19 @@ def compress_k_complete_kernel_new_padded(
 ):
     """
     Padded layout version: stores compressed keys in batch-major order.
-    
+
     Output layout: full_compressed_k[batch_idx * max_chunks_per_seq + chunk_idx]
     This allows using reshape() to view per-batch data for debugging.
-    
+
     Grid: (batch_size, min(max_total_chunks, max_grid_chunks), head_num_k)
     where max_total_chunks = max_chunks_per_seq + max_history_chunks
-    
+
     If total_chunks > max_grid_chunks, each thread block loops to handle multiple chunks.
     """
     batch_idx = tl.program_id(0)
     grid_chunk_idx = tl.program_id(1)
     head_idx = tl.program_id(2)
-    
+
     # Total number of chunks this thread block needs to process
     # Each thread block handles: grid_chunk_idx, grid_chunk_idx + max_grid_chunks, grid_chunk_idx + 2*max_grid_chunks, ...
     chunk_stride = max_grid_chunks
@@ -343,15 +342,15 @@ def compress_k_complete_kernel_new_padded(
     # ====================================================================
     # LOOP: Handle multiple chunks per thread block if needed
     # ====================================================================
-    
+
     # Iterate over all chunks assigned to this thread block
     # chunk_in_seq = grid_chunk_idx, grid_chunk_idx + chunk_stride, grid_chunk_idx + 2*chunk_stride, ...
     chunk_in_seq = grid_chunk_idx
-    
+
     while chunk_in_seq < total_chunks_in_seq:
         # Skip if this chunk_in_seq doesn't exist
         # (This check is now inside the loop)
-        
+
         # Determine if processing history or new chunks
         is_history_chunk = chunk_in_seq < history_chunks_in_seq
 
@@ -495,7 +494,7 @@ def compress_k_complete_kernel_new_padded(
                                 x,
                                 mask=tl.arange(0, BLOCK_SIZE) < head_dim
                             )
-        
+
         # Move to next chunk for this thread block
         chunk_in_seq += chunk_stride
 

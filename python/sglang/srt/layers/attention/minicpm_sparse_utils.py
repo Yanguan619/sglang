@@ -7,33 +7,32 @@ combining both backend-agnostic sparse attention components and kernel utilities
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# import tilelang
-# import tilelang.math
 import triton
-# from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
-
-# from sglang.srt.layers.attention.minicpm_fuse_kernel import _bucket_size
 from sglang.srt.layers.attention.minicpm_sparse_kernels import (
     compress_k_complete_kernel_new,
     compress_k_complete_kernel_new_padded,
 )
 
-import math
+if torch.cuda.is_available():
+    from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
+else:
+    # Instead of using the cuda version, we use the torch version for multi chip support
+    from unum_ops.infllm_v2 import infllmv2_attn_stage1
+    from unum_ops.infllm_v2 import max_pooling_1d_varlen
 
 logger = logging.getLogger(__name__)
 
@@ -365,15 +364,19 @@ def allocate_and_compress_keys(
         Tuple of (full_compressed_k1, full_compressed_k2)
     """
     if device is None:
-        device = (
-            layer.device if hasattr(layer, "device") else torch.cuda.current_device()
-        )
+        device = layer.device if hasattr(layer, "device") else torch.cuda.current_device()
 
     full_compressed_k1 = torch.full(
-        (k1_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
+        (k1_token_nums, layer.tp_k_head_num, layer.head_dim),
+        dtype=dtype,
+        device=device,
+        fill_value=float("-inf"),
     )
     full_compressed_k2 = torch.full(
-        (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
+        (k2_token_nums, layer.tp_k_head_num, layer.head_dim),
+        dtype=dtype,
+        device=device,
+        fill_value=float("-inf"),
     )
 
     if split_stage1:
@@ -481,7 +484,6 @@ def compressed_attention(
         # else:
         #     q_idx = cache_lens // block_size
 
-
         # split-stage1 -> bmm+softmax+reduce_sum
         if not is_prefilling and split_stage1:
             batch_size = q.shape[0]
@@ -492,10 +494,10 @@ def compressed_attention(
             head_dim = k.shape[2]
             q_reshape = (
                 q.reshape(batch_size, 1, q_head, head_dim)
-                    .transpose(1, 2)
-                    .reshape(batch_size, kv_head, group_size, head_dim)
-                    .transpose(0, 1)
-                    .reshape(-1, group_size, head_dim)
+                .transpose(1, 2)
+                .reshape(batch_size, kv_head, group_size, head_dim)
+                .transpose(0, 1)
+                .reshape(-1, group_size, head_dim)
             )
             k_reshape = (
                 k.reshape(batch_size, k1_len // batch_size, kv_head, head_dim)
@@ -520,7 +522,7 @@ def compressed_attention(
                 cu_seqlens_v=cu_seqlens_k2,
                 max_seqlen_q=max_seqlen_q_adjusted,
                 max_seqlen_k=max_context_len // kernel_stride,
-                causal=is_prefilling
+                causal=is_prefilling,
             )
 
         block_score = max_pooling_1d_varlen(
@@ -544,183 +546,6 @@ def compressed_attention(
         topk_idx = topk_idx.to(torch.int32)
 
     return topk_idx
-
-
-def compressed_attention_tilelang(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    k2: torch.Tensor,
-    kernel_size: int,
-    kernel_stride: int,
-    block_size: int,
-    topk: int,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    cu_seqlens_k2: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    sm_scale: float = None,
-    init_blocks: int = 1,
-    local_blocks: int = 2,
-    cache_lens=None,
-    fused_kernel=None,
-    max_cache_len=-1,
-) -> torch.Tensor:
-    """
-    使用 tilelang online topk kernel 计算 compressed attention topk indices
-    """
-    with torch.no_grad():
-        batch_size = cu_seqlens_q.shape[0] - 1
-
-        # Check if it's prefilling stage
-        # Use max_seqlen_q > 1 to avoid .item() call for CUDA Graph compatibility
-        is_prefilling = cache_lens is None or max_seqlen_q > 1
-
-        # Fixed max_cache_len for CUDA Graph compatibility (avoid .item() calls)
-        # max_cache_len = 525312  # 512k
-
-
-        # Get tensor dimensions
-        # q shape: [total_q_len, num_kv_heads, groups, head_dim] or [total_q_len, num_heads, head_dim]
-        # k shape: [total_k_len, num_kv_heads, head_dim]
-        total_q_len = q.shape[0]
-        total_k_len = k.shape[0]
-        num_kv_heads = k.shape[1]
-        head_dim = k.shape[2]
-
-        # Determine num_heads and groups
-        # if q.dim() == 4:
-        #     groups = q.shape[2]
-        #     num_heads = num_kv_heads * groups
-        #     # Reshape q from [total_q_len, num_kv_heads, groups, head_dim] to [total_q_len * groups, num_kv_heads, head_dim]
-        #     q_kernel = q.transpose(1, 2).reshape(total_q_len * groups, num_kv_heads, head_dim).contiguous()
-        # else:
-        num_heads = q.shape[1]
-        groups = num_heads // num_kv_heads
-        # q shape: [total_q_len, num_heads, head_dim]
-        # Need to reshape to [total_q_len * groups, num_kv_heads, head_dim]
-        q_kernel = q.view(total_q_len, num_kv_heads, groups, head_dim)
-        q_kernel = q_kernel.transpose(1, 2).reshape(total_q_len * groups, num_kv_heads, head_dim).contiguous()
-
-        k_kernel = k.contiguous()
-
-        # Compute pooled_k_len using infllmv2 formula (based on block count):
-        # total_len = max_seqlen_q + cache_len
-        # out_len = (total_len + block_size - 1) // block_size
-        if is_prefilling:
-            # Prefill: use the actual max_seqlen_q
-            total_len = max_seqlen_q
-            pooled_k_len = (max_cache_len + block_size - 1) // block_size
-        else:
-            # Decode: use fixed max_cache_len for CUDA Graph compatibility
-            # Kernel uses actual_pooled_k_len internally for dynamic bounds checking
-            pooled_k_len = (max_cache_len + block_size - 1) // block_size
-            # assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
-
-        assert fused_kernel is not None, "fused_kernel is not initialized"
-
-
-        # Pooling parameters - aligned with infllmv2_cuda_impl:
-        # block_stride = block_size // kernel_stride = 64 // 16 = 4
-        # pad_len = kernel_size // kernel_stride - 1 = 32 // 16 - 1 = 1
-        # num_offs = kernel_size // kernel_stride + block_size // kernel_stride - 1 = 2 + 4 - 1 = 5
-        pooling_block_stride = block_size // kernel_stride  # = 64 // 16 = 4
-        pooling_pad_len = kernel_size // kernel_stride - 1  # = 32 // 16 - 1 = 1
-        pooling_num_offs = kernel_size // kernel_stride + block_size // kernel_stride - 1  # = 2 + 4 - 1 = 5
-
-        # Compute actual output topk (same as original: min(topk, num_blocks))
-        output_topk = min(topk, pooled_k_len)
-
-        # For the kernel, we need power of 2 topk
-        topk_power2 = tilelang.math.next_power_of_2(output_topk)
-        kernel_topk = min(topk_power2, pooled_k_len)
-        # Make sure it's still power of 2
-        if kernel_topk != tilelang.math.next_power_of_2(kernel_topk):
-            kernel_topk = tilelang.math.next_power_of_2(kernel_topk) // 2
-        kernel_topk = max(8, kernel_topk)  # Minimum topk for kernel
-
-        # Determine dtype string
-        if q.dtype == torch.float16:
-            dtype_str = "float16"
-        elif q.dtype == torch.bfloat16:
-            dtype_str = "bfloat16"
-        else:
-            dtype_str = "bfloat16"
-
-        # Allocate output tensors
-        topk_indices = torch.full((num_kv_heads, total_q_len, kernel_topk), -1, dtype=torch.int32, device=q.device)
-        topk_values = torch.full((num_kv_heads, total_q_len, kernel_topk), float('-inf'), dtype=torch.float32, device=q.device)
-
-        if is_prefilling:
-            # =================================================================
-            # PREFILL: Use bucketed max_seqlen_q and pooled_k_len
-            # Compiles once per unique bucket combination
-            # Supports chunk prefill with cache_lens tensor
-            # =================================================================
-            # bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
-            bucketed_pooled_k_len = _bucket_size(pooled_k_len)
-            # Also bucket actual_max_seqlen_q/k to reduce kernel recompilation
-            # bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
-            # bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
-
-            # Prepare cache_lens tensor for chunk prefill support
-            # For standard prefill: cache_lens is None -> use zeros
-            # For chunk prefill: cache_lens has values -> use as-is
-            if cache_lens is None:
-                cache_lens_tensor = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
-            else:
-                cache_lens_tensor = cache_lens.to(torch.int32)
-
-
-
-            # Run prefill kernel with cache_lens for chunk prefill support
-            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
-        else:
-            # =================================================================
-            # DECODE: max_seqlen_q=1 (fixed), cache_lens passed as tensor
-            # Compiles ONCE and reuses for all decode steps!
-            # =================================================================
-            bucketed_pooled_k_len = _bucket_size(pooled_k_len)
-
-            # Prepare cache_lens as tensor (runtime value, not compile-time constant!)
-            cache_lens_tensor = cache_lens.to(torch.int32)
-
-            # kernel = fused_attn_pooling_online_topk_decode(
-            #     batch_size=batch_size,
-            #     groups=groups,
-            #     heads=num_heads,
-            #     dim=head_dim,
-            #     topk=kernel_topk,
-            #     pooled_k_len=bucketed_pooled_k_len,
-            #     m_block_dim=16,
-            #     block_stride=pooling_block_stride,
-            #     pad_len=pooling_pad_len,
-            #     num_offs=pooling_num_offs,
-            #     block_size=block_size,
-            #     init_blocks=init_blocks,
-            #     local_blocks=local_blocks,
-            #     dtype_str=dtype_str
-            # )
-
-            # Run decode kernel with cache_lens as tensor
-            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
-
-        # Note: q_idx masking is handled inside the kernel via causal_mask
-        # which sets scores to -1e9 for K blocks beyond the causal boundary.
-        # These blocks won't be selected in topk due to their low scores.
-
-        # Sort with -1 values at the end (match original behavior)
-        # Replace -1 with large value, sort, then replace back
-        large_val = pooled_k_len + 1000  # Any value larger than max valid index
-        topk_for_sort = topk_indices.clone()
-        topk_for_sort[topk_for_sort == -1] = large_val
-        topk_idx = topk_for_sort.sort(-1).values
-        topk_idx[topk_idx == large_val] = -1
-
-        # Truncate to output_topk (same as original: min(topk, num_blocks))
-        topk_idx = topk_idx[:, :, :output_topk]
-
-        return topk_idx
 
 
 @dataclass
@@ -902,7 +727,9 @@ class SparseBatchAnalyzer:
         """
         self.config = config
 
-    def identify_sparse_batches(self, forward_batch: ForwardBatch, dense_as_sparse: bool) -> list[int]:
+    def identify_sparse_batches(
+        self, forward_batch: ForwardBatch, dense_as_sparse: bool
+    ) -> list[int]:
         """Identify sparse batches in the forward batch.
 
         A batch is considered sparse if its sequence length is >= dense_len.
@@ -925,7 +752,9 @@ class SparseBatchAnalyzer:
 
         return sparse_bs_list
 
-    def is_sparse_batch(self, batch_idx: int, forward_batch: ForwardBatch, dense_as_sparse: bool) -> bool:
+    def is_sparse_batch(
+        self, batch_idx: int, forward_batch: ForwardBatch, dense_as_sparse: bool
+    ) -> bool:
         """Check if a specific batch index needs sparse attention.
 
         Args:
@@ -935,7 +764,9 @@ class SparseBatchAnalyzer:
         Returns:
             True if the batch needs sparse attention, False otherwise
         """
-        return bool(forward_batch.seq_lens_cpu[batch_idx] >= self.config.dense_len or dense_as_sparse)
+        return bool(
+            forward_batch.seq_lens_cpu[batch_idx] >= self.config.dense_len or dense_as_sparse
+        )
 
     def get_sparse_batch_count(self, forward_batch: ForwardBatch) -> int:
         """Get the count of sparse batches in the forward batch.
@@ -960,9 +791,7 @@ class SparseMetadataBuilder:
     by SparseBatchAnalyzer as needing sparse attention.
     """
 
-    def __init__(
-        self, config: SparseConfig, num_kv_heads: int, max_context_len: int = 32768
-    ):
+    def __init__(self, config: SparseConfig, num_kv_heads: int, max_context_len: int = 32768):
         """Initialize SparseMetadataBuilder with sparse configuration.
 
         Args:
@@ -1042,9 +871,7 @@ class SparseMetadataBuilder:
             token_to_bs[start:end] = i
 
         # Build token_pos_in_bs: position of each token within its batch
-        token_pos_in_bs = torch.zeros(
-            q_shape_sparse_bs, dtype=torch.int32, device="cpu"
-        )
+        token_pos_in_bs = torch.zeros(q_shape_sparse_bs, dtype=torch.int32, device="cpu")
         for i in range(len(seqlen_q_sparse_bs)):
             start = cu_seqlens_q_sparse_bs[i]
             end = cu_seqlens_q_sparse_bs[i + 1]
@@ -1099,9 +926,7 @@ class SparseMetadataBuilder:
             Dictionary with compression metadata fields for this level
         """
         bs = forward_batch.batch_size
-        seqlen_cpu = torch.zeros(
-            (bs,), dtype=base_metadata.cu_seqlens_q.dtype, device="cpu"
-        )
+        seqlen_cpu = torch.zeros((bs,), dtype=base_metadata.cu_seqlens_q.dtype, device="cpu")
 
         for i in range(bs):
             # if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -1119,9 +944,7 @@ class SparseMetadataBuilder:
 
         max_seq_len = seqlen_cpu.max().item()
         cu_seqlens = F.pad(
-            torch.cumsum(
-                seqlen_cpu.to(device=cu_seqlens_q.device), dim=0, dtype=torch.int32
-            ),
+            torch.cumsum(seqlen_cpu.to(device=cu_seqlens_q.device), dim=0, dtype=torch.int32),
             (1, 0),
         )
         token_table = req_to_sparse_token[forward_batch.req_pool_indices]
@@ -1137,9 +960,7 @@ class SparseMetadataBuilder:
 
         new_token_nums = token_nums - history_compress_token_nums * kernel_stride
 
-        cu_new_token_nums = F.pad(
-            torch.cumsum(new_token_nums, dim=0, dtype=torch.int32), (1, 0)
-        )
+        cu_new_token_nums = F.pad(torch.cumsum(new_token_nums, dim=0, dtype=torch.int32), (1, 0))
 
         new_compress_token_nums = torch.maximum(
             (new_token_nums - kernel_size) // kernel_stride + 1,
@@ -1150,9 +971,7 @@ class SparseMetadataBuilder:
             torch.cumsum(new_compress_token_nums, dim=0, dtype=torch.int32), (1, 0)
         )
 
-        total_compress_token_nums = (
-            history_compress_token_nums + new_compress_token_nums
-        )
+        total_compress_token_nums = history_compress_token_nums + new_compress_token_nums
 
         cu_total_compress_token_nums = F.pad(
             torch.cumsum(total_compress_token_nums, dim=0, dtype=torch.int32), (1, 0)
@@ -1291,12 +1110,8 @@ class SparseMetadataBuilder:
 
         for i in range(bs):
             if forward_batch.seq_lens_cpu[i] >= dense_len:
-                max_sparse_cache_len = max(
-                    max_sparse_cache_len, sparse_topk * block_size
-                )
-                sparse_page_table_bs += (
-                    forward_batch.extend_seq_lens_cpu[i] * head_group_num
-                )
+                max_sparse_cache_len = max(max_sparse_cache_len, sparse_topk * block_size)
+                sparse_page_table_bs += forward_batch.extend_seq_lens_cpu[i] * head_group_num
                 old_bs_to_new_bs_range[i + 1] = (
                     old_bs_to_new_bs_range[i]
                     + head_group_num * forward_batch.extend_seq_lens_cpu[i]
@@ -1306,9 +1121,7 @@ class SparseMetadataBuilder:
                     max_sparse_cache_len, forward_batch.extend_seq_lens_cpu[i]
                 )
                 sparse_page_table_bs += head_group_num
-                old_bs_to_new_bs_range[i + 1] = (
-                    old_bs_to_new_bs_range[i] + head_group_num
-                )
+                old_bs_to_new_bs_range[i + 1] = old_bs_to_new_bs_range[i] + head_group_num
                 sparse_max_seq_len_q = max(
                     sparse_max_seq_len_q, forward_batch.extend_seq_lens_cpu[i]
                 )
@@ -1331,14 +1144,11 @@ class SparseMetadataBuilder:
             else:
                 for _ in range(head_group_num):
                     sparse_cu_seqlens_q_cpu[pt + 1] = (
-                        sparse_cu_seqlens_q_cpu[pt]
-                        + forward_batch.extend_seq_lens_cpu[i]
+                        sparse_cu_seqlens_q_cpu[pt] + forward_batch.extend_seq_lens_cpu[i]
                     )
                     pt += 1
 
-        assert (
-            pt == sparse_page_table_bs
-        ), f"sparse_page_table_bs {sparse_page_table_bs} vs pt {pt}"
+        assert pt == sparse_page_table_bs, f"sparse_page_table_bs {sparse_page_table_bs} vs pt {pt}"
 
         sparse_cu_seqlens_q = sparse_cu_seqlens_q_cpu.to(device=cu_seqlens_q.device)
 
@@ -1416,9 +1226,7 @@ class SparseMetadataBuilder:
                 sparse_cache_seqlens_cpu[2 * b] = cache_seqlens[b]
                 sparse_cache_seqlens_cpu[2 * b + 1] = cache_seqlens[b]
 
-        sparse_cache_seqlens_int32 = sparse_cache_seqlens_cpu.to(
-            device=cache_seqlens.device
-        )
+        sparse_cache_seqlens_int32 = sparse_cache_seqlens_cpu.to(device=cache_seqlens.device)
         sparse_cu_seqlens_k = F.pad(
             torch.cumsum(sparse_cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
         )
@@ -1443,9 +1251,7 @@ class SparseMetadataBuilder:
             "token_to_bs": token_to_bs,
         }
 
-    def build(
-        self, forward_batch: ForwardBatch, base_metadata: object
-    ) -> SparseMetadata:
+    def build(self, forward_batch: ForwardBatch, base_metadata: object) -> SparseMetadata:
         """Build complete sparse metadata for the forward batch.
 
         This method orchestrates the entire metadata building process:
@@ -1579,9 +1385,7 @@ class SparseMetadataBuilder:
                 seqlens_k_sparse_bs.append(seqlens_k[i].item())
 
         cu_seqlens_q = torch.cumsum(
-            torch.tensor(
-                [0] + seqlens_q, dtype=torch.int32, device=query_states.device
-            ),
+            torch.tensor([0] + seqlens_q, dtype=torch.int32, device=query_states.device),
             dim=0,
             dtype=torch.int32,
         )
@@ -1591,16 +1395,12 @@ class SparseMetadataBuilder:
         query_states = batched_gather(query_states_reshaped, cu_seqlens_q, sparse_bs)
 
         cu_seqlens_q_sparse = torch.cumsum(
-            torch.tensor(
-                [0] + seqlens_q_sparse_bs, dtype=torch.int32, device=query_states.device
-            ),
+            torch.tensor([0] + seqlens_q_sparse_bs, dtype=torch.int32, device=query_states.device),
             dim=0,
             dtype=torch.int32,
         )
         cu_seqlens_k_sparse = torch.cumsum(
-            torch.tensor(
-                [0] + seqlens_k_sparse_bs, dtype=torch.int32, device=query_states.device
-            ),
+            torch.tensor([0] + seqlens_k_sparse_bs, dtype=torch.int32, device=query_states.device),
             dim=0,
             dtype=torch.int32,
         )
