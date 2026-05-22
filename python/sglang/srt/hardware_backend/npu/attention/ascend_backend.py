@@ -14,6 +14,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.attention.minicpm_sparse_utils import (
+    SparseConfig,
+    SparseBatchAnalyzer,
+    SparseMetadataBuilder,
+)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -57,6 +63,12 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # MiniCPM sparse attention fields
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    cu_seqlens_k: Optional[torch.Tensor] = None
+    cache_seqlens_int32: Optional[torch.Tensor] = None
+    max_seq_len_q: int = 1
 
 
 class AscendAttnMaskBuilder:
@@ -234,6 +246,43 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
+        # MiniCPM sparse attention
+        hf_config = getattr(model_runner.model_config, "hf_config", None)
+        self.has_minicpm_sparse = hf_config is not None and getattr(
+            hf_config, "has_sparse_attention", False
+        )
+        if self.has_minicpm_sparse:
+            self.kernel_size = hf_config.sparse_kernel_size
+            self.kernel_stride = hf_config.sparse_kernel_stride
+            self.block_size = hf_config.sparse_block_size
+            self.window_size = hf_config.sparse_window_size
+            self.sparse_topk = hf_config.sparse_topk + (
+                self.window_size // self.block_size
+            )
+            self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
+            self.dense_len = hf_config.sparse_dense_len
+            self.init_blocks = hf_config.sparse_init_blocks
+            self.local_blocks = self.window_size // self.block_size
+            self.k1_kernel_size = self.kernel_size
+            self.k1_kernel_stride = self.kernel_stride
+            self.k2_kernel_size = self.kernel_size * 4
+            self.k2_kernel_stride = self.kernel_stride * 4
+
+            sparse_config = SparseConfig.from_model_config(
+                hf_config, model_runner.model_config
+            )
+            self.sparse_batch_analyzer = SparseBatchAnalyzer(sparse_config)
+            self.sparse_metadata_builder = SparseMetadataBuilder(
+                sparse_config,
+                num_kv_heads=model_runner.model_config.num_key_value_heads
+                // get_tensor_model_parallel_world_size(),
+                max_context_len=self.max_context_len,
+            )
+            self.max_sparse_pages = (
+                self.num_sparse_topk_tokens + self.page_size - 1
+            ) // self.page_size
+            self.pages_per_block = self.block_size // self.page_size  # 0 if block < page
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -302,6 +351,9 @@ class AscendAttnBackend(AttentionBackend):
                         torch.flatten(req_prefix_block_tables),
                     )
                 )
+
+        if self.has_minicpm_sparse:
+            self._init_minicpm_sparse_metadata(forward_batch)
 
         self.graph_mode = False
 
@@ -564,6 +616,253 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _init_minicpm_sparse_metadata(self, forward_batch: ForwardBatch):
+        """Build MiniCPM sparse metadata in forward_metadata.
+
+        This stores the base metadata (cu_seqlens, cache_seqlens, page_table)
+        and calls SparseMetadataBuilder to compute K1/K2 compression metadata.
+        """
+        m = self.forward_metadata
+        bs = forward_batch.batch_size
+        device = self.device
+        seqlens = forward_batch.seq_lens
+
+        m.cache_seqlens_int32 = seqlens.to(torch.int32)
+        m.max_seq_len_q = 1
+        m.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+        m.cu_seqlens_q = torch.arange(
+            0, bs + 1, dtype=torch.int32, device=device
+        )
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            m.max_seq_len_q = 1
+        elif forward_batch.forward_mode.is_extend():
+            m.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+            m.cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+
+        # Build K1/K2 compression metadata via SparseMetadataBuilder (pure PyTorch)
+        compression = self.sparse_metadata_builder.build_k1_k2_compression_metadata(
+            forward_batch=forward_batch,
+            base_metadata=m,
+            req_to_sparse_k1_token=(
+                forward_batch.req_to_token_pool.req_to_sparse_k1_token
+                if hasattr(forward_batch.req_to_token_pool, "req_to_sparse_k1_token")
+                else None
+            ),
+            req_to_sparse_k2_token=(
+                forward_batch.req_to_token_pool.req_to_sparse_k2_token
+                if hasattr(forward_batch.req_to_token_pool, "req_to_sparse_k2_token")
+                else None
+            ),
+            k1_kernel_size=self.k1_kernel_size,
+            k1_kernel_stride=self.k1_kernel_stride,
+            k2_kernel_size=self.k2_kernel_size,
+            k2_kernel_stride=self.k2_kernel_stride,
+            cu_seqlens_q=m.cu_seqlens_q,
+        )
+        m.k1 = compression["k1"]
+        m.k2 = compression["k2"]
+
+    def _minicpm_sparse_to_npu_block_table(
+        self, topk_idx, page_table, batch_size, max_seq_len_k
+    ):
+        """Convert MiniCPM top-k block indices to NPU block_table.
+
+        topk_idx: [num_heads, num_tokens, topk]  block-level indices
+        page_table: [batch, max_seq_len]  token-level positions from req_to_token
+
+        Returns:
+            block_table: [batch, max_sparse_pages] page indices for NPU
+            context_lens: [batch] number of sparse tokens per batch
+        """
+        num_heads, total_q, topk = topk_idx.shape
+        max_sparse_pages = self.max_sparse_pages
+        block_table = torch.zeros(
+            batch_size, max_sparse_pages, dtype=torch.int32, device=self.device
+        )
+        ctx_lens = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+
+        tokens_per_block = self.block_size
+        page_stride = self.page_size // tokens_per_block  # = 2 when page=128, block=64
+
+        for b in range(batch_size):
+            all_blocks = topk_idx[:, b, :]  # [num_heads, topk]
+            blocks_flat = all_blocks.unique()
+            blocks_flat = blocks_flat[blocks_flat >= 0]
+
+            if blocks_flat.numel() == 0:
+                continue
+
+            # Convert block indices to page positions in the KV cache
+            page_positions = blocks_flat * tokens_per_block // self.page_size  # [num_unique_pages]
+
+            # Map to physical page indices from req_to_token
+            unique_pages = torch.unique(page_positions)
+            n_pages = unique_pages.numel()
+            if n_pages == 0:
+                continue
+            n_pages = min(n_pages, max_sparse_pages)
+
+            logical_page_offsets = unique_pages[:n_pages].to(torch.int64) * self.page_size
+            physical_pages = page_table[b, logical_page_offsets]
+            physical_pages = torch.where(
+                logical_page_offsets < max_seq_len_k,
+                physical_pages // self.page_size,
+                torch.zeros_like(physical_pages),
+            )
+
+            block_table[b, :n_pages] = physical_pages.to(torch.int32)
+            ctx_lens[b] = n_pages * self.page_size
+
+        return block_table, ctx_lens
+
+    def forward_minicpm_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        """Forward for MiniCPM sparse attention on NPU.
+
+        Pipeline:
+          1. Save KV cache
+          2. Compute compressed keys (k1/k2) → topk block indices
+          3. Build NPU block_table from topk indices
+          4. Call _npu_paged_attention
+        """
+        if save_kv_cache and k is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
+        m = self.forward_metadata
+        bs = forward_batch.batch_size
+
+        # Determine if this is prefill or decode
+        is_prefill = forward_batch.forward_mode.is_extend()
+        max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+
+        # Token-level page table (req_to_token)
+        token_pt = self.req_to_token[
+            forward_batch.req_pool_indices, :max_seq_len_k
+        ]
+
+        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # --- Step 1: Compute topk block indices ---
+        from sglang.srt.layers.attention.minicpm_sparse_utils import (
+            allocate_and_compress_keys,
+            compressed_attention,
+            get_compress_k_v2,
+        )
+        from unum_ops.src.unum_ops.sparse_kernel_extension.get_table_triton import (
+            get_block_table_ref_triton,
+        )
+
+        k1_token_nums = sum(
+            m.k1.cu_total_compress_token_nums[i].item()
+            for i in range(bs)
+        ) if hasattr(m, "k1") and m.k1 is not None else 0
+        k2_token_nums = sum(
+            m.k2.cu_total_compress_token_nums[i].item()
+            for i in range(bs)
+        ) if hasattr(m, "k2") and m.k2 is not None else 0
+
+        if k1_token_nums == 0:
+            # Fallback: basic dense attention if no sparse metadata
+            attn_output = torch.empty(
+                q_reshaped.shape[0], layer.tp_q_head_num, layer.v_head_dim,
+                device=self.device, dtype=q.dtype,
+            )
+            torch_npu._npu_paged_attention(
+                query=q_reshaped,
+                key_cache=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                ),
+                value_cache=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                ),
+                num_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                scale_value=layer.scaling,
+                block_table=self.forward_metadata.block_tables,
+                context_lens=forward_batch.seq_lens.to(torch.int32),
+                out=attn_output,
+            )
+            return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        # Compress keys using the cross-platform utility
+        full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=m,
+            k1_token_nums=k1_token_nums,
+            k2_token_nums=k2_token_nums,
+            dtype=torch.bfloat16,
+            device=self.device,
+            max_context_length=self.max_context_len,
+            split_stage1=True,
+        )
+
+        # Compute compressed attention → topk block indices
+        topk_idx = compressed_attention(
+            q_reshaped,
+            full_compressed_k1,
+            full_compressed_k2,
+            self.kernel_size,
+            self.kernel_stride,
+            self.block_size,
+            self.sparse_topk,
+            m.cu_seqlens_q,
+            m.k1.cu_seqlens,
+            m.k2.cu_seqlens,
+            m.max_seq_len_q,
+            self.max_context_len,
+            None,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+        )
+
+        # Convert block indices to NPU sparse block_table
+        block_table, ctx_lens = self._minicpm_sparse_to_npu_block_table(
+            topk_idx, token_pt, bs, max_seq_len_k
+        )
+
+        # --- Step 2: Call _npu_paged_attention ---
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        )
+
+        attn_output = torch.empty(
+            q_reshaped.shape[0], layer.tp_q_head_num, layer.v_head_dim,
+            device=self.device, dtype=q.dtype,
+        )
+        torch_npu._npu_paged_attention(
+            query=q_reshaped,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            num_heads=layer.tp_q_head_num,
+            num_kv_heads=layer.tp_k_head_num,
+            scale_value=layer.scaling,
+            block_table=block_table,
+            context_lens=ctx_lens.to(torch.int64, non_blocking=True),
+            out=attn_output,
+        )
+
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -577,6 +876,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if self.has_minicpm_sparse and not self.use_mla:
+            return self.forward_minicpm_sparse(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
         if topk_indices is not None:
             return self.forward_sparse(
                 q,
@@ -1218,6 +1521,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if self.has_minicpm_sparse and not self.use_mla:
+            return self.forward_minicpm_sparse(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
             save_kv_cache = False
