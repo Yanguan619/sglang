@@ -762,10 +762,6 @@ class AscendAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minicpm_sparse_utils import (
             allocate_and_compress_keys,
             compressed_attention,
-            get_compress_k_v2,
-        )
-        from unum_ops.src.unum_ops.sparse_kernel_extension.get_table_triton import (
-            get_block_table_ref_triton,
         )
 
         k1_token_nums = sum(
@@ -783,19 +779,53 @@ class AscendAttnBackend(AttentionBackend):
                 q_reshaped.shape[0], layer.tp_q_head_num, layer.v_head_dim,
                 device=self.device, dtype=q.dtype,
             )
-            torch_npu._npu_paged_attention(
-                query=q_reshaped,
-                key_cache=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-                ),
-                value_cache=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-                ),
-                num_heads=layer.tp_q_head_num,
-                num_kv_heads=layer.tp_k_head_num,
-                scale_value=layer.scaling,
-                block_table=self.forward_metadata.block_tables,
+            # print(f'{q_reshaped.shape=}')
+            # print(f'{self.page_size=}, {layer.tp_k_head_num=}, {layer.head_dim=}')
+            # print(f'{forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape=}')
+            # print(f'{forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape=}')
+            # print(f"{layer.tp_q_head_num=}")
+            # print(f"{layer.scaling=}")
+            # print(f"{self.forward_metadata.block_tables.shape=}")
+            # print(f"{forward_batch.seq_lens.shape=}")
+            # print(f"{attn_output.shape=}")
+            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            # torch_npu._npu_paged_attention(
+            #     query=q_reshaped,
+            #     key_cache=key_cache,
+            #     value_cache=value_cache,
+            #     num_heads=layer.tp_q_head_num,
+            #     num_kv_heads=layer.tp_k_head_num,
+            #     scale_value=layer.scaling,
+            #     block_table=self.forward_metadata.block_tables,
+            #     context_lens=forward_batch.seq_lens.to(torch.int32),
+            #     out=attn_output,
+            # )
+            workspace = torch_npu.atb._npu_paged_attention_v2_get_workspace(
+                q_reshaped,
+                key_cache,
+                self.forward_metadata.block_tables,
                 context_lens=forward_batch.seq_lens.to(torch.int32),
+                value_cache=value_cache,
+                num_kv_heads=layer.tp_k_head_num,
+                num_heads=layer.tp_q_head_num,
+                scale_value=layer.scaling,
+                out=attn_output,
+            )
+            torch_npu.atb._npu_paged_attention_v2(
+                q_reshaped,
+                key_cache,
+                self.forward_metadata.block_tables,
+                forward_batch.seq_lens.to(torch.int32),
+                value_cache=value_cache,
+                num_kv_heads=layer.tp_k_head_num,
+                num_heads=layer.tp_q_head_num,
+                scale_value=layer.scaling,
+                workspace=workspace,
                 out=attn_output,
             )
             return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
