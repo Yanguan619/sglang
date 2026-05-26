@@ -7,19 +7,19 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.minicpm_sparse_utils import (
-    SparseConfig,
     SparseBatchAnalyzer,
+    SparseConfig,
     SparseMetadataBuilder,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -252,6 +252,7 @@ class AscendAttnBackend(AttentionBackend):
             hf_config, "has_sparse_attention", False
         )
         if self.has_minicpm_sparse:
+            logger.info("======== Detected minicpm sparse.")
             self.kernel_size = hf_config.sparse_kernel_size
             self.kernel_stride = hf_config.sparse_kernel_stride
             self.block_size = hf_config.sparse_block_size
@@ -281,7 +282,9 @@ class AscendAttnBackend(AttentionBackend):
             self.max_sparse_pages = (
                 self.num_sparse_topk_tokens + self.page_size - 1
             ) // self.page_size
-            self.pages_per_block = self.block_size // self.page_size  # 0 if block < page
+            self.pages_per_block = (
+                self.block_size // self.page_size
+            )  # 0 if block < page
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -633,9 +636,7 @@ class AscendAttnBackend(AttentionBackend):
             torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0)
         )
         max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-        m.cu_seqlens_q = torch.arange(
-            0, bs + 1, dtype=torch.int32, device=device
-        )
+        m.cu_seqlens_q = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             m.max_seq_len_q = 1
@@ -700,7 +701,9 @@ class AscendAttnBackend(AttentionBackend):
                 continue
 
             # Convert block indices to page positions in the KV cache
-            page_positions = blocks_flat * tokens_per_block // self.page_size  # [num_unique_pages]
+            page_positions = (
+                blocks_flat * tokens_per_block // self.page_size
+            )  # [num_unique_pages]
 
             # Map to physical page indices from req_to_token
             unique_pages = torch.unique(page_positions)
@@ -709,7 +712,9 @@ class AscendAttnBackend(AttentionBackend):
                 continue
             n_pages = min(n_pages, max_sparse_pages)
 
-            logical_page_offsets = unique_pages[:n_pages].to(torch.int64) * self.page_size
+            logical_page_offsets = (
+                unique_pages[:n_pages].to(torch.int64) * self.page_size
+            )
             physical_pages = page_table[b, logical_page_offsets]
             physical_pages = torch.where(
                 logical_page_offsets < max_seq_len_k,
@@ -752,9 +757,7 @@ class AscendAttnBackend(AttentionBackend):
         max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
 
         # Token-level page table (req_to_token)
-        token_pt = self.req_to_token[
-            forward_batch.req_pool_indices, :max_seq_len_k
-        ]
+        token_pt = self.req_to_token[forward_batch.req_pool_indices, :max_seq_len_k]
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -764,20 +767,25 @@ class AscendAttnBackend(AttentionBackend):
             compressed_attention,
         )
 
-        k1_token_nums = sum(
-            m.k1.cu_total_compress_token_nums[i].item()
-            for i in range(bs)
-        ) if hasattr(m, "k1") and m.k1 is not None else 0
-        k2_token_nums = sum(
-            m.k2.cu_total_compress_token_nums[i].item()
-            for i in range(bs)
-        ) if hasattr(m, "k2") and m.k2 is not None else 0
+        k1_token_nums = (
+            sum(m.k1.cu_total_compress_token_nums[i].item() for i in range(bs))
+            if hasattr(m, "k1") and m.k1 is not None
+            else 0
+        )
+        k2_token_nums = (
+            sum(m.k2.cu_total_compress_token_nums[i].item() for i in range(bs))
+            if hasattr(m, "k2") and m.k2 is not None
+            else 0
+        )
 
         if k1_token_nums == 0:
             # Fallback: basic dense attention if no sparse metadata
             attn_output = torch.empty(
-                q_reshaped.shape[0], layer.tp_q_head_num, layer.v_head_dim,
-                device=self.device, dtype=q.dtype,
+                q_reshaped.shape[0],
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                device=self.device,
+                dtype=q.dtype,
             )
             # print(f'{q_reshaped.shape=}')
             # print(f'{self.page_size=}, {layer.tp_k_head_num=}, {layer.head_dim=}')
@@ -788,12 +796,12 @@ class AscendAttnBackend(AttentionBackend):
             # print(f"{self.forward_metadata.block_tables.shape=}")
             # print(f"{forward_batch.seq_lens.shape=}")
             # print(f"{attn_output.shape=}")
-            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-            )
+            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                layer.layer_id
+            ).view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+            value_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                layer.layer_id
+            ).view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
             # torch_npu._npu_paged_attention(
             #     query=q_reshaped,
             #     key_cache=key_cache,
@@ -876,8 +884,11 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         attn_output = torch.empty(
-            q_reshaped.shape[0], layer.tp_q_head_num, layer.v_head_dim,
-            device=self.device, dtype=q.dtype,
+            q_reshaped.shape[0],
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            device=self.device,
+            dtype=q.dtype,
         )
         torch_npu._npu_paged_attention(
             query=q_reshaped,
@@ -907,6 +918,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if self.has_minicpm_sparse and not self.use_mla:
+            logger.info("======== forward_extend => forward_minicpm_sparse")
             return self.forward_minicpm_sparse(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
@@ -1552,6 +1564,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if self.has_minicpm_sparse and not self.use_mla:
+            logger.info("======== forward_decode => forward_minicpm_sparse")
             return self.forward_minicpm_sparse(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
