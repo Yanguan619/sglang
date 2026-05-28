@@ -64,6 +64,24 @@ python3 -m sglang.launch_server \
     --context-length 132000 \
     --max-total-tokens 132000 \
     --mem-fraction-static 0.9
+
+
+# Step 1: Start profiling (no num_steps, requires manual stop)
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "./sglang_profile",
+    "start_step": 1,
+    "activities": ["CPU", "NPU"]
+  }'
+
+# Step 2: Send workload requests (using curl as example)
+curl http://127.0.0.1:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 10}}'
+
+# Step 3: Stop profiling
+curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 # curl

@@ -25,7 +25,10 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
-
+from sglang.srt.layers.attention.minicpm_sparse_utils import (
+    allocate_and_compress_keys,
+    compressed_attention,
+)
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -419,6 +422,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -762,11 +766,6 @@ class AscendAttnBackend(AttentionBackend):
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # --- Step 1: Compute topk block indices ---
-        from sglang.srt.layers.attention.minicpm_sparse_utils import (
-            allocate_and_compress_keys,
-            compressed_attention,
-        )
-
         k1_token_nums = (
             sum(m.k1.cu_total_compress_token_nums[i].item() for i in range(bs))
             if hasattr(m, "k1") and m.k1 is not None
@@ -918,7 +917,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if self.has_minicpm_sparse and not self.use_mla:
-            logger.info("======== forward_extend => forward_minicpm_sparse")
+            # logger.info("======== forward_extend => forward_minicpm_sparse")
             return self.forward_minicpm_sparse(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
@@ -1564,7 +1563,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if self.has_minicpm_sparse and not self.use_mla:
-            logger.info("======== forward_decode => forward_minicpm_sparse")
+            # logger.info("======== forward_decode => forward_minicpm_sparse")
             return self.forward_minicpm_sparse(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
