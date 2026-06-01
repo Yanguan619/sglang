@@ -453,6 +453,10 @@ def compressed_attention(
     Returns:
         Top-k block indices, shape (num_heads, total_q_len, topk)
     """
+    if cu_seqlens_q_adjusted is None:
+        cu_seqlens_q_adjusted = cu_seqlens_q
+    if max_seqlen_q_adjusted is None:
+        max_seqlen_q_adjusted = max_seqlen_q
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
 
@@ -937,6 +941,11 @@ class SparseMetadataBuilder:
             #         + 1,
             #     )
             # else:
+            """
+            所有序列长度 < k1 kernel_size (默认 64)：_compute_single_compression_metadata 中 total_compress_token_nums 的计算:
+            seqlen_cpu [i] = max(0, (seq_lens - kernel_size) // kernel_stride + 1)
+            如果所有 seq_lens < 64, 压缩 token 数为 0.
+            """
             seqlen_cpu[i] = max(
                 0,
                 (forward_batch.seq_lens_cpu[i] - kernel_size) // kernel_stride + 1,
