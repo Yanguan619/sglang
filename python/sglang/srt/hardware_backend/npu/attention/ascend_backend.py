@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-
+import unum_ops.sparse_kernel_extension as sparse_kernel_extension
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -17,6 +17,8 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseBatchAnalyzer,
     SparseConfig,
     SparseMetadataBuilder,
+    allocate_and_compress_keys,
+    compressed_attention,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -25,10 +27,6 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.layers.attention.minicpm_sparse_utils import (
-    allocate_and_compress_keys,
-    compressed_attention,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -784,73 +782,173 @@ class AscendAttnBackend(AttentionBackend):
     def _minicpm_sparse_to_npu_block_table(self, topk_idx, page_table, batch_size, max_seq_len_k):
         """Convert MiniCPM top-k block indices to per-head-group NPU block_table.
 
-        topk_idx: [num_heads, num_tokens, topk]  block-level indices (all heads)
+        topk_idx: [num_heads, total_q, topk]  block-level indices (all heads)
         page_table: [batch, max_seq_len]  token-level positions from req_to_token
 
-        Splits topk_idx into 2 head groups internally so each group gets its own
-        sparse page selection.  Returns 2 × batch rows.
+        Uses sparse_kernel_extension.get_block_table_v2 (prefill) or
+        get_block_table_v3 (decode) for the heavy computation, then deduplicates
+        page entries per head group into contiguous page indices.
 
         Returns:
             block_table: [batch * 2, max_sparse_pages] per-head-group page indices
             ctx_lens: [batch * 2] per-head-group number of sparse tokens
         """
-        num_heads, total_q, topk = topk_idx.shape
-        half_heads = num_heads // 2
+        m = self.forward_metadata
         max_sparse_pages = self.max_sparse_pages
-        tokens_per_block = self.block_size
+        is_prefill = hasattr(m, "sparse_bs_list") and m.sparse_bs_list is not None
 
         block_table = torch.zeros(
             batch_size * 2, max_sparse_pages, dtype=torch.int32, device=self.device
         )
         ctx_lens = torch.zeros(batch_size * 2, dtype=torch.int32, device=self.device)
 
-        for b in range(batch_size):
-            for gi, h_start in enumerate([0, half_heads]):
-                h_end = h_start + half_heads
-                group_blocks = topk_idx[h_start:h_end, b, :]  # [half_heads, topk]
-                blocks_flat = group_blocks.unique()
-                blocks_flat = blocks_flat[blocks_flat >= 0]
+        if is_prefill:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v2(
+                topk_idx,
+                page_table,
+                m.token_to_bs,
+                m.token_pos_in_bs,
+                m.seqlen_k_sparse_bs_tensor,
+                self.sparse_topk,
+            ).reshape(-1, self.num_sparse_topk_tokens)
 
-                if blocks_flat.numel() == 0:
-                    continue
+            for i, sparse_bs in enumerate(m.sparse_bs_list):
+                for gi in range(2):
+                    src = i * 2 + gi
+                    dst = sparse_bs * 2 + gi
+                    entries = sparse_page_table[src]
+                    valid = entries > 0
+                    unique_pages = torch.unique(entries[valid])
+                    n_pages = unique_pages.numel()
+                    if n_pages == 0:
+                        continue
+                    n_pages = min(n_pages, max_sparse_pages)
+                    block_table[dst, :n_pages] = unique_pages[:n_pages].to(torch.int32)
+                    ctx_lens[dst] = n_pages * self.page_size
+        else:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v3(
+                topk_idx,
+                page_table,
+                m.token_to_bs,
+                m.cache_seqlens_int32,
+                m.cache_seqlens_int32,
+                self.sparse_topk,
+            ).reshape(-1, self.num_sparse_topk_tokens)
 
-                page_positions = blocks_flat * tokens_per_block // self.page_size
-
-                unique_pages = torch.unique(page_positions)
+            for out_idx in range(batch_size * 2):
+                entries = sparse_page_table[out_idx]
+                valid = entries > 0
+                unique_pages = torch.unique(entries[valid])
                 n_pages = unique_pages.numel()
                 if n_pages == 0:
                     continue
                 n_pages = min(n_pages, max_sparse_pages)
-
-                logical_page_offsets = unique_pages[:n_pages].to(torch.int64) * self.page_size
-                physical_pages = page_table[b, logical_page_offsets]
-                physical_pages = torch.where(
-                    logical_page_offsets < max_seq_len_k,
-                    physical_pages // self.page_size,
-                    torch.zeros_like(physical_pages),
-                )
-
-                out_idx = b * 2 + gi
-                block_table[out_idx, :n_pages] = physical_pages.to(torch.int32)
+                block_table[out_idx, :n_pages] = unique_pages[:n_pages].to(torch.int32)
                 ctx_lens[out_idx] = n_pages * self.page_size
 
+        logger.debug(f"Block table for sparse attention: {block_table}")
         return block_table, ctx_lens
 
-    def _compute_sparse_cache_lens(self, m, max_seq_len_k):
-        """Compute cache_lens for stage1 sparse top-k optimisation.
+    def get_topk_for_sparse(self, q_full, layer, forward_batch, is_prefill=True):
+        m = self.forward_metadata
+        bs = forward_batch.batch_size
 
-        Mirrors MiniCPMSparseBackend.sparse_get_topk_impl logic.
-        """
-        if m.cache_seqlens_int32_stage1 is not None:
-            return m.cache_seqlens_int32_stage1
-        if max_seq_len_k > m.max_seq_len_q:
-            if m.max_seq_len_q == 1:
-                return m.cache_seqlens_int32 - 1
-            seq_lens_k = m.cu_seqlens_k[1:] - m.cu_seqlens_k[:-1]
-            seq_lens_q = m.cu_seqlens_q[1:] - m.cu_seqlens_q[:-1]
-            return seq_lens_k - seq_lens_q
-        batch_size = m.cu_seqlens_q.shape[0] - 1
-        return torch.zeros(batch_size, dtype=torch.int32, device=m.cu_seqlens_q.device)
+        k1_token_nums = (
+            sum(m.k1.total_compress_token_nums[i].item() for i in range(bs))
+            if hasattr(m, "k1") and m.k1 is not None
+            else 0
+        )
+        k2_token_nums = (
+            sum(m.k2.total_compress_token_nums[i].item() for i in range(bs))
+            if hasattr(m, "k2") and m.k2 is not None
+            else 0
+        )
+        logger.debug(f"MiniCPM sparse attention: {k1_token_nums=}, {k2_token_nums=}")
+        if k1_token_nums == 0:
+            return None
+
+        full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=m,
+            k1_token_nums=k1_token_nums,
+            k2_token_nums=k2_token_nums,
+            dtype=torch.bfloat16,
+            device=self.device,
+            max_context_length=self.max_context_len,
+            split_stage1=True,
+        )
+
+        max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+
+        topk_idx = self.sparse_get_topk_impl(
+            q_full,
+            m.cu_seqlens_q,
+            m.cu_seqlens_k,
+            m.max_seq_len_q,
+            max_seq_len_k,
+            compressed_k=full_compressed_k1,
+            compressed_cu_seqlens=m.k1.cu_seqlens,
+            compressed_k2=full_compressed_k2,
+            compressed_cu_seqlens2=m.k2.cu_seqlens,
+        )
+
+        return topk_idx
+
+    def sparse_get_topk_impl(
+        self,
+        query_layer,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_in_batch_q,
+        max_seqlen_in_batch_k,
+        compressed_k=None,
+        compressed_cu_seqlens=None,
+        compressed_k2=None,
+        compressed_cu_seqlens2=None,
+    ):
+        if self.forward_metadata.cache_seqlens_int32_stage1 is not None:
+            cache_lens = self.forward_metadata.cache_seqlens_int32_stage1
+        else:
+            if max_seqlen_in_batch_k > self.forward_metadata.max_seq_len_q:
+                if self.forward_metadata.max_seq_len_q == 1:
+                    return self.forward_metadata.cache_seqlens_int32 - 1
+                seq_lens_k = (
+                    self.forward_metadata.cu_seqlens_k[1:] - self.forward_metadata.cu_seqlens_k[:-1]
+                )
+                seq_lens_q = (
+                    self.forward_metadata.cu_seqlens_q[1:] - self.forward_metadata.cu_seqlens_q[:-1]
+                )
+                cache_lens = seq_lens_k - seq_lens_q
+            else:
+                batch_size = self.forward_metadata.cu_seqlens_q.shape[0] - 1
+                cache_lens = torch.zeros(
+                    batch_size, dtype=torch.int32, device=self.forward_metadata.cu_seqlens_q.device
+                )
+
+        topk_idx = compressed_attention(
+            query_layer,
+            compressed_k,
+            compressed_k2,
+            self.kernel_size,
+            self.kernel_stride,
+            self.block_size,
+            self.sparse_topk,
+            cu_seqlens_q,
+            compressed_cu_seqlens,
+            compressed_cu_seqlens2,
+            max_seqlen_in_batch_q,
+            self.max_context_len,
+            None,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            cache_lens=cache_lens,
+            cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
+            max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
+            split_stage1=self.split_stage1,
+        )
+
+        return topk_idx
 
     def forward_minicpm_sparse(
         self,
@@ -884,20 +982,8 @@ class AscendAttnBackend(AttentionBackend):
         q_full = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # --- Step 1: Compute topk block indices ---
-        k1_token_nums = (
-            sum(m.k1.total_compress_token_nums[i].item() for i in range(bs))
-            if hasattr(m, "k1") and m.k1 is not None
-            else 0
-        )
-        k2_token_nums = (
-            sum(m.k2.total_compress_token_nums[i].item() for i in range(bs))
-            if hasattr(m, "k2") and m.k2 is not None
-            else 0
-        )
-        logger.info(
-            f"MiniCPM sparse attention: k1_token_nums={k1_token_nums}, k2_token_nums={k2_token_nums}"
-        )
-        if k1_token_nums == 0:
+        topk_idx = self.get_topk_for_sparse(q_full, layer, forward_batch, is_prefill)
+        if topk_idx is None:
             if self.graph_mode:
                 return self.forward_decode_graph(q, k, v, layer, forward_batch, False)
             attn_output = torch.empty(
@@ -930,51 +1016,61 @@ class AscendAttnBackend(AttentionBackend):
             )
             return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-        # Compress keys
-        full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
-            layer=layer,
-            forward_batch=forward_batch,
-            metadata=m,
-            k1_token_nums=k1_token_nums,
-            k2_token_nums=k2_token_nums,
-            dtype=torch.bfloat16,
-            device=self.device,
-            max_context_length=self.max_context_len,
-            split_stage1=True,
-        )
-
-        # --- Stage1 optimisation: compute cache_lens ---
-        cache_lens = self._compute_sparse_cache_lens(m, max_seq_len_k)
-
-        # Compute compressed attention → topk block indices
-        topk_idx = compressed_attention(
-            q_full,
-            full_compressed_k1,
-            full_compressed_k2,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.sparse_topk,
-            m.cu_seqlens_q,
-            m.k1.cu_seqlens,
-            m.k2.cu_seqlens,
-            m.max_seq_len_q,
-            self.max_context_len,
-            None,
-            init_blocks=self.init_blocks,
-            local_blocks=self.local_blocks,
-            cache_lens=cache_lens,
-            cu_seqlens_q_adjusted=m.cu_seqlens_q_adjusted,
-            max_seqlen_q_adjusted=m.max_seqlen_q_adjusted,
-            split_stage1=self.split_stage1,
-        )
-
         # --- Step 2: Build per-head-group sparse block table ---
         # topk_idx: [num_heads, total_q, topk]; _minicpm_sparse_to_npu_block_table
         # internally splits into 2 head groups → [bs * 2, max_sparse_pages]
-        block_table, ctx_lens = self._minicpm_sparse_to_npu_block_table(
-            topk_idx, token_pt, bs, max_seq_len_k
+        max_sparse_pages = self.max_sparse_pages
+        is_prefill = (
+            hasattr(self.forward_metadata, "sparse_bs_list")
+            and self.forward_metadata.sparse_bs_list is not None
         )
+
+        block_table = torch.zeros(bs * 2, max_sparse_pages, dtype=torch.int32, device=self.device)
+        ctx_lens = torch.zeros(bs * 2, dtype=torch.int32, device=self.device)
+
+        if is_prefill:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v2(
+                topk_idx,
+                token_pt,
+                self.forward_metadata.token_to_bs,
+                self.forward_metadata.token_pos_in_bs,
+                self.forward_metadata.seqlen_k_sparse_bs_tensor,
+                self.sparse_topk,
+            ).reshape(-1, self.num_sparse_topk_tokens)
+
+            for i, sparse_bs in enumerate(self.forward_metadata.sparse_bs_list):
+                for gi in range(2):
+                    src = i * 2 + gi
+                    dst = sparse_bs * 2 + gi
+                    entries = sparse_page_table[src]
+                    valid = entries > 0
+                    unique_pages = torch.unique(entries[valid])
+                    n_pages = unique_pages.numel()
+                    if n_pages == 0:
+                        continue
+                    n_pages = min(n_pages, max_sparse_pages)
+                    block_table[dst, :n_pages] = unique_pages[:n_pages].to(torch.int32)
+                    ctx_lens[dst] = n_pages * self.page_size
+        else:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v3(
+                topk_idx,
+                token_pt,
+                self.forward_metadata.token_to_bs,
+                self.forward_metadata.cache_seqlens_int32,
+                self.forward_metadata.cache_seqlens_int32,
+                self.sparse_topk,
+            ).reshape(-1, self.num_sparse_topk_tokens)
+
+            for out_idx in range(bs * 2):
+                entries = sparse_page_table[out_idx]
+                valid = entries > 0
+                unique_pages = torch.unique(entries[valid])
+                n_pages = unique_pages.numel()
+                if n_pages == 0:
+                    continue
+                n_pages = min(n_pages, max_sparse_pages)
+                block_table[out_idx, :n_pages] = unique_pages[:n_pages].to(torch.int32)
+                ctx_lens[out_idx] = n_pages * self.page_size
 
         # --- Step 3: Reshape q for head groups (interleaved → blocked layout) ---
         # q_full: [total_q, tp_q_head_num, head_dim]
